@@ -1,0 +1,873 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>方块世界 · 体素沙盒</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' fill='%2368ab4a'/%3E%3Crect x='12' y='12' width='18' height='18' fill='%23866043'/%3E%3Crect x='34' y='12' width='18' height='18' fill='%23866043'/%3E%3Crect x='12' y='34' width='18' height='18' fill='%23866043'/%3E%3Crect x='34' y='34' width='18' height='18' fill='%235a4a3a'/%3E%3C/svg%3E">
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; background:#000;
+    font-family:"Segoe UI","PingFang SC","Microsoft YaHei",system-ui,sans-serif; user-select:none; }
+  canvas { display:block; }
+  #crosshair { position:fixed; left:50%; top:50%; width:18px; height:18px; margin:-9px 0 0 -9px;
+    pointer-events:none; z-index:5; }
+  #crosshair:before,#crosshair:after{ content:""; position:absolute; background:rgba(255,255,255,.85); }
+  #crosshair:before{ left:8px; top:0; width:2px; height:18px; }
+  #crosshair:after{ left:0; top:8px; width:18px; height:2px; }
+  #hotbar { position:fixed; left:50%; bottom:14px; transform:translateX(-50%);
+    display:flex; gap:4px; z-index:5; }
+  .slot { width:46px; height:46px; border:2px solid rgba(255,255,255,.35); border-radius:4px;
+    background:rgba(0,0,0,.45); display:flex; flex-direction:column; align-items:center; justify-content:center;
+    color:#fff; font-size:11px; }
+  .slot .sw { width:26px; height:26px; border-radius:2px; margin-bottom:2px; }
+  .slot.sel { border-color:#fff; background:rgba(255,255,255,.2); }
+  #hud { position:fixed; top:10px; left:10px; color:#fff; font-size:12px; z-index:5;
+    text-shadow:0 1px 2px rgba(0,0,0,.6); line-height:1.7; }
+  #clock { position:fixed; top:10px; right:10px; color:#fff; font-size:12px; z-index:5; text-align:right;
+    text-shadow:0 1px 2px rgba(0,0,0,.7); line-height:1.6; }
+  #clock .ph { font-size:15px; font-weight:700; }
+  #clock .bar { width:110px; height:6px; background:rgba(255,255,255,.22); border-radius:3px; margin-top:4px; margin-left:auto; }
+  #clock .bar>div { height:100%; border-radius:3px; background:linear-gradient(90deg,#ffd27a,#ff9a3c); }
+  #overlay { position:fixed; inset:0; z-index:10; background:rgba(0,0,0,.68); color:#fff;
+    display:flex; flex-direction:column; align-items:center; justify-content:center; gap:10px;
+    cursor:pointer; text-align:center; }
+  #overlay h1 { font-size:30px; letter-spacing:2px; }
+  #overlay p { font-size:14px; color:#cfd8e3; line-height:2; }
+  #overlay .go { margin-top:8px; padding:10px 28px; border:1px solid #fff; border-radius:6px; font-size:16px; }
+  #overlay.hidden { display:none; }
+</style>
+</head>
+<body>
+<div id="crosshair"></div>
+<div id="hotbar"></div>
+<div id="hud"></div>
+<div id="clock"><div class="ph" id="clkPh">白天</div><div class="bar"><div id="clkBar" style="width:0%"></div></div></div>
+<div id="overlay">
+  <h1>方块世界</h1>
+  <p>
+    W A S D 移动 · 鼠标转向 · 空格跳跃 · 左键挖方块 · 右键放方块<br>
+    数字键 1-7 切换方块 · ESC 释放鼠标 · 夜晚有僵尸出没，白天会自动消失
+  </p>
+  <div class="go">点击进入世界</div>
+</div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+"use strict";
+/* ================= 世界数据 ================= */
+const W = 128, D = 128, H = 48, CS = 16, WATER_Y = 13;
+const world = new Uint8Array(W * D * H);
+const idx = (x, y, z) => (y * D + z) * W + x;
+const inB = (x, y, z) => x >= 0 && x < W && z >= 0 && z < D && y >= 0 && y < H;
+function getB(x, y, z){ if (!inB(x, y, z)) return 0; return world[idx(x, y, z)]; }
+function setB(x, y, z, b){ if (inB(x, y, z)) world[idx(x, y, z)] = b; }
+const B = { AIR:0, GRASS:1, DIRT:2, STONE:3, SAND:4, WATER:5, WOOD:6, LEAVES:7, GLASS:8 };
+const BNAME = {};
+BNAME[B.GRASS] = "草方块"; BNAME[B.DIRT] = "泥土"; BNAME[B.STONE] = "石头";
+BNAME[B.SAND] = "沙子"; BNAME[B.WOOD] = "木头"; BNAME[B.LEAVES] = "树叶"; BNAME[B.GLASS] = "玻璃";
+function isSolidB(x, y, z){ const b = getB(x, y, z); return b !== B.AIR && b !== B.WATER; }
+function isInWater(x,y,z){ return getB(x,y,z)===B.WATER; }
+/* ================= 程序化地形 ================= */
+function hash(x, z){ const s = Math.sin(x * 127.1 + z * 311.7) * 43758.5453; return s - Math.floor(s); }
+function vnoise(x, z){
+  const xi = Math.floor(x), zi = Math.floor(z), xf = x - xi, zf = z - zi;
+  const u = xf * xf * (3 - 2 * xf), v = zf * zf * (3 - 2 * zf);
+  const a = hash(xi, zi), b = hash(xi + 1, zi), c = hash(xi, zi + 1), d = hash(xi + 1, zi + 1);
+  return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v;
+}
+function heightAt(x, z){
+  const n = vnoise(x * 0.035, z * 0.035) * 0.68 + vnoise(x * 0.09 + 100, z * 0.09 + 100) * 0.32;
+  return Math.floor(13 + n * 19);
+}
+function genWorld(){
+  for (let x = 0; x < W; x++){
+    for (let z = 0; z < D; z++){
+      const h = heightAt(x, z);
+      for (let y = 0; y < H; y++){
+        if (y > h) setB(x, y, z, y <= WATER_Y ? B.WATER : B.AIR);
+        else if (y === h) setB(x, y, z, h <= WATER_Y + 1 ? B.SAND : B.GRASS);
+        else if (y > h - 3) setB(x, y, z, B.DIRT);
+        else setB(x, y, z, B.STONE);
+      }
+      if (h > WATER_Y + 2 && hash(x * 3.1, z * 7.7) < 0.016){
+        const th = 4 + Math.floor(hash(x * 9.3, z * 5.1) * 2);
+        for (let t = 1; t <= th; t++) setB(x, h + t, z, B.WOOD);
+        const ty = h + th;
+        for (let dx = -2; dx <= 2; dx++){
+          for (let dz = -2; dz <= 2; dz++){
+            for (let dy = -1; dy <= 1; dy++){
+              if (dx * dx + dz * dz + dy * dy <= 4 && hash(x + dx * 7, z + dz * 13 + dy * 3) > 0.25){
+                if (getB(x + dx, ty + dy, z + dz) === B.AIR) setB(x + dx, ty + dy, z + dz, B.LEAVES);
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+/* ================= 程序化贴图（16px 图集） ================= */
+const TILES = 16;
+const ac = document.createElement("canvas");
+ac.width = 16 * TILES; ac.height = 16;
+const actx = ac.getContext("2d");
+function speck(i, base, jit){
+  for (let y = 0; y < 16; y++){
+    for (let x = 0; x < 16; x++){
+      const j = (Math.random() * 2 - 1) * jit;
+      actx.fillStyle = "rgb(" + ((base[0] + j) | 0) + "," + ((base[1] + j) | 0) + "," + ((base[2] + j) | 0) + ")";
+      actx.fillRect(i * 16 + x, y, 1, 1);
+    }
+  }
+}
+speck(0, [104, 171, 74], 18);    // 0 草顶
+speck(2, [134, 96, 67], 16);     // 2 泥土
+for (let y = 0; y < 16; y++){
+  for (let x = 0; x < 16; x++){
+    const top = y < 3;
+    const j = (Math.random() * 2 - 1) * 16;
+    const b = top ? [104, 171, 74] : [134, 96, 67];
+    actx.fillStyle = "rgb(" + ((b[0] + j) | 0) + "," + ((b[1] + j) | 0) + "," + ((b[2] + j) | 0) + ")";
+    actx.fillRect(16 + x, y, 1, 1);
+  }
+}
+speck(3, [128, 128, 134], 14);   // 3 石头
+speck(4, [219, 201, 141], 14);   // 4 沙子
+speck(5, [74, 138, 208], 14);    // 5 水
+for (let y = 0; y < 16; y++){
+  for (let x = 0; x < 16; x++){
+    const stripe = (x % 4 === 0) ? -28 : 0;
+    const j = (Math.random() * 2 - 1) * 10;
+    actx.fillStyle = "rgb(" + ((110 + stripe + j) | 0) + "," + ((82 + stripe + j) | 0) + "," + ((46 + stripe + j) | 0) + ")";
+    actx.fillRect(6 * 16 + x, y, 1, 1);
+  }
+}
+for (let y = 0; y < 16; y++){
+  for (let x = 0; x < 16; x++){
+    const d = Math.sqrt((x - 7.5) * (x - 7.5) + (y - 7.5) * (y - 7.5));
+    const ring = Math.sin(d * 2.2) > 0 ? -18 : 0;
+    actx.fillStyle = "rgb(" + ((150 + ring) | 0) + "," + ((116 + ring) | 0) + "," + ((74 + ring) | 0) + ")";
+    actx.fillRect(7 * 16 + x, y, 1, 1);
+  }
+}
+speck(8, [46, 116, 55], 22);     // 8 树叶
+actx.clearRect(9 * 16, 0, 16, 16);
+for (let y = 0; y < 16; y++){
+  for (let x = 0; x < 16; x++){
+    const edge = x === 0 || y === 0 || x === 15 || y === 15;
+    actx.fillStyle = edge ? "rgba(220,240,248,0.95)" : "rgba(200,228,238,0.35)";
+    actx.fillRect(9 * 16 + x, y, 1, 1);
+  }
+}
+// 10 花（黄心白瓣，透明底）
+actx.clearRect(10 * 16, 0, 16, 16);
+for (let y = 0; y < 16; y++){
+  for (let x = 0; x < 16; x++){
+    const dx = x - 7.5, dy = y - 7.5, d = Math.sqrt(dx * dx + dy * dy);
+    if (d < 3.2){ actx.fillStyle = "#f7f7e8"; actx.fillRect(10 * 16 + x, y, 1, 1); }
+    else if (d < 4.4 && Math.random() < 0.5){ actx.fillStyle = "#fff6d8"; actx.fillRect(10 * 16 + x, y, 1, 1); }
+    if (d < 1.5){ actx.fillStyle = "#e8b23a"; actx.fillRect(10 * 16 + x, y, 1, 1); }
+  }
+}
+// 11 草叶（绿色细条，透明底）
+actx.clearRect(11 * 16, 0, 16, 16);
+for (let y = 0; y < 16; y++){
+  for (let x = 0; x < 16; x++){
+    const blade = (x % 3 === 0) || (x % 3 === 1 && y > 9);
+    if (blade && Math.random() < 0.82){
+      const j = (Math.random() * 2 - 1) * 20;
+      actx.fillStyle = "rgb(" + ((84 + j) | 0) + "," + ((150 + j) | 0) + "," + ((52 + j) | 0) + ")";
+      actx.fillRect(10 * 16 + x + 16, y, 1, 1);
+    }
+  }
+}
+// 12 太阳（柔光圆，透明底）
+actx.clearRect(12 * 16, 0, 16, 16);
+for (let y = 0; y < 16; y++){
+  for (let x = 0; x < 16; x++){
+    const dx = x - 7.5, dy = y - 7.5, d = Math.sqrt(dx * dx + dy * dy);
+    if (d < 3){ actx.fillStyle = "#fff7cf"; actx.fillRect(12 * 16 + x, y, 1, 1); }
+    else if (d < 6.2){ actx.fillStyle = "rgba(255,220,130," + (0.5 * (1 - (d - 3) / 3.2)).toFixed(2) + ")"; actx.fillRect(12 * 16 + x, y, 1, 1); }
+  }
+}
+// 13 月亮（银白圆，透明底）
+actx.clearRect(13 * 16, 0, 16, 16);
+for (let y = 0; y < 16; y++){
+  for (let x = 0; x < 16; x++){
+    const dx = x - 7.5, dy = y - 7.5, d = Math.sqrt(dx * dx + dy * dy);
+    if (d < 3.4){ actx.fillStyle = "#e8eef2"; actx.fillRect(13 * 16 + x, y, 1, 1); }
+    else if (d < 5.6 && d > 3.4 && Math.random() < 0.35){ actx.fillStyle = "rgba(200,215,225,0.4)"; actx.fillRect(13 * 16 + x, y, 1, 1); }
+  }
+}
+const tex = new THREE.CanvasTexture(ac);
+tex.magFilter = THREE.NearestFilter;
+tex.minFilter = THREE.NearestFilter;
+tex.generateMipmaps = false;
+const [T] = [TILES];
+const TILEMAP = {};
+TILEMAP[B.GRASS] = [0, 2, 1];
+TILEMAP[B.DIRT]  = [2, 2, 2];
+TILEMAP[B.STONE] = [3, 3, 3];
+TILEMAP[B.SAND]  = [4, 4, 4];
+TILEMAP[B.WATER] = [5, 5, 5];
+TILEMAP[B.WOOD]  = [7, 7, 6];
+TILEMAP[B.LEAVES] = [8, 8, 8];
+TILEMAP[B.GLASS] = [9, 9, 9];
+const FACES = [
+  { dir:[1,0,0],  corners:[[1,0,0],[1,1,0],[1,1,1],[1,0,1]] },
+  { dir:[-1,0,0], corners:[[0,0,1],[0,1,1],[0,1,0],[0,0,0]] },
+  { dir:[0,1,0],  corners:[[0,1,1],[0,1,0],[1,1,0],[1,1,1]] },
+  { dir:[0,-1,0], corners:[[0,0,0],[0,0,1],[1,0,1],[1,0,0]] },
+  { dir:[0,0,1],  corners:[[0,0,1],[1,0,1],[1,1,1],[0,1,1]] },
+  { dir:[0,0,-1], corners:[[1,0,0],[0,0,0],[0,1,0],[1,1,0]] }
+];
+const FACE_KIND = [2, 2, 0, 1, 2, 2];
+/* ================= three.js 场景 ================= */
+const scene = new THREE.Scene();
+const fogDay = new THREE.Color(0x8fd0f2);
+scene.background = fogDay.clone();
+scene.fog = new THREE.Fog(0x8fd0f2, 36, 110);
+const camera = new THREE.PerspectiveCamera(75, innerWidth / innerHeight, 0.1, 1200);
+camera.rotation.order = "YXZ";
+const renderer = new THREE.WebGLRenderer({ antialias:true });
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.outputEncoding = THREE.sRGBEncoding;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.05;
+document.body.appendChild(renderer.domElement);
+const hemi = new THREE.HemisphereLight(0xcfe0ff, 0x6b5a44, 0.8);
+scene.add(hemi);
+const sunLight = new THREE.DirectionalLight(0xfff4e0, 0.7);
+sunLight.position.set(60, 90, 40);
+scene.add(sunLight);
+const moonLight = new THREE.DirectionalLight(0x9fb8ff, 0.0);
+moonLight.position.set(-60, 80, -40);
+scene.add(moonLight);
+const matOpaque = new THREE.MeshLambertMaterial({ map:tex, side:THREE.DoubleSide });
+const waterTex = tex.clone();
+waterTex.needsUpdate = true;
+const matWater = new THREE.MeshLambertMaterial({ map:waterTex, transparent:true, opacity:0.7, depthWrite:false, color:0x9fc8ee });
+/* ================= 昼夜系统 ================= */
+const CYCLE = 140;              // 一个昼夜周期秒数
+const C_DAY = new THREE.Color(0x8fd0f2);
+const C_DUSK = new THREE.Color(0xf08a4e);
+const C_NIGHT = new THREE.Color(0x070d1f);
+const _c = new THREE.Color();
+let phase = 0.18;               // 0=午夜, 0.25=正午
+let sunAlt = Math.sin(phase * Math.PI * 2);
+function skyColorAt(sunAlt){
+  if (sunAlt >= 0){
+    if (sunAlt < 0.22){ _c.lerpColors(C_DUSK, C_DAY, sunAlt / 0.22); }
+    else _c.copy(C_DAY);
+  } else if (sunAlt > -0.28){
+    _c.lerpColors(C_NIGHT, C_DUSK, (sunAlt + 0.28) / 0.28);
+  } else _c.copy(C_NIGHT);
+  return _c;
+}
+// 太阳 / 月亮
+function makeDisc(tile, scale){
+  const cv = document.createElement("canvas");
+  cv.width = cv.height = 128;
+  const c2 = cv.getContext("2d");
+  c2.drawImage(ac, tile * 16, 0, 16, 16, 0, 0, 128, 128);
+  const t = new THREE.CanvasTexture(cv);
+  const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map:t, transparent:true, fog:false, depthWrite:false }));
+  sp.scale.set(scale, scale, 1);
+  sp.visible = false;
+  scene.add(sp);
+  return sp;
+}
+const sunDisc = makeDisc(12, 46);
+const moonDisc = makeDisc(13, 34);
+// 星星
+const starGeo = new THREE.BufferGeometry();
+{
+  const n = 420, pos = new Float32Array(n * 3);
+  for (let i = 0; i < n; i++){
+    const a = Math.random() * Math.PI * 2, b = Math.acos(Math.random() * 0.9);
+    const r = 300;
+    pos[i * 3] = Math.cos(a) * Math.sin(b) * r;
+    pos[i * 3 + 1] = Math.cos(b) * r + 30;
+    pos[i * 3 + 2] = Math.sin(a) * Math.sin(b) * r;
+  }
+  starGeo.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+}
+const starMat = new THREE.PointsMaterial({ color:0xffffff, size:1.6, transparent:true, opacity:0, fog:false, sizeAttenuation:true });
+const stars = new THREE.Points(starGeo, starMat);
+scene.add(stars);
+// 云
+const cloudGroup = new THREE.Group();
+{
+  const cm = new THREE.MeshLambertMaterial({ color:0xffffff, transparent:true, opacity:0.82 });
+  for (let i = 0; i < 10; i++){
+    const g = new THREE.Group();
+    const cw = 8 + Math.random() * 10, ch = 2 + Math.random() * 1.6, cd = 5 + Math.random() * 6;
+    const blobs = 3 + (Math.random() * 3 | 0);
+    for (let b = 0; b < blobs; b++){
+      const m = new THREE.Mesh(new THREE.BoxGeometry(cw * (0.5 + Math.random() * 0.4), ch * (0.6 + Math.random() * 0.5), cd * (0.6 + Math.random() * 0.5)), cm);
+      m.position.set((Math.random() - 0.5) * cw * 0.8, (Math.random() - 0.5) * ch * 0.5, (Math.random() - 0.5) * cd * 0.8);
+      g.add(m);
+    }
+    g.position.set(Math.random() * W * 2 - W / 2, 36 + Math.random() * 5, Math.random() * D * 2 - D / 2);
+    g.userData.spd = 0.25 + Math.random() * 0.5;
+    cloudGroup.add(g);
+  }
+}
+scene.add(cloudGroup);
+function updateSky(dt, now){
+  phase = (phase + dt / CYCLE) % 1;
+  const ang = phase * Math.PI * 2;
+  sunAlt = Math.sin(ang);
+  const col = skyColorAt(sunAlt);
+  scene.background.copy(col);
+  scene.fog.color.copy(col);
+  // 光强
+  const dayK = THREE.MathUtils.clamp(sunAlt * 5, 0, 1);
+  hemi.intensity = 0.12 + dayK * 0.85;
+  hemi.color.copy(_c).lerp(new THREE.Color(0xbfd8ff), 1 - dayK);
+  sunLight.intensity = dayK * 0.85;
+  sunLight.color.setHex(0xfff2dc).lerp(new THREE.Color(0xff9a55), Math.max(0, 1 - dayK * 3));
+  moonLight.intensity = (1 - dayK) * 0.32;
+  const R = 220, cx = W / 2, cz = D / 2;
+  sunDisc.position.set(cx + Math.cos(ang) * R, Math.max(6, Math.sin(ang) * R) , cz + R * 0.35);
+  sunDisc.visible = sunAlt > -0.28;
+  moonDisc.position.set(cx - Math.cos(ang) * R, Math.max(6, -Math.sin(ang) * R), cz - R * 0.35);
+  moonDisc.visible = sunAlt < 0.12;
+  sunLight.position.copy(sunDisc.position);
+  moonLight.position.copy(moonDisc.position);
+  starMat.opacity = Math.max(0, Math.min(1, (0.12 - sunAlt) / 0.3));
+  waterTex.offset.y = (waterTex.offset.y + dt * 0.02) % 1;
+  // 云飘移
+  cloudGroup.children.forEach(c => {
+    c.position.x += c.userData.spd * dt;
+    if (c.position.x > W / 2 + 40) c.position.x = -W / 2 - 40;
+  });
+  // HUD
+  const phName = sunAlt > 0.2 ? "白天" : (sunAlt > -0.2 ? (phase < 0.5 ? "清晨" : "黄昏") : "夜晚");
+  document.getElementById("clkPh").textContent = phName;
+  document.getElementById("clkBar").style.width = (phase * 100).toFixed(0) + "%";
+}
+/* ================= 区块网格构建 ================= */
+const chunkMeshes = new Map();
+function isTransparent(b){ return b === B.AIR || b === B.WATER || b === B.LEAVES || b === B.GLASS; }
+function buildChunk(cx, cz){
+  const key = cx + "," + cz;
+  const old = chunkMeshes.get(key);
+  if (old){
+    scene.remove(old.opaque); scene.remove(old.water);
+    old.opaque.geometry.dispose(); old.water.geometry.dispose();
+  }
+  const pos = [], uv = [], nor = [], idxr = [];
+  const wpos = [], wuv = [], wnor = [], widxr = [];
+  for (let x = cx * CS; x < cx * CS + CS; x++){
+    for (let z = cz * CS; z < cz * CS + CS; z++){
+      for (let y = 0; y < H; y++){
+        const b = getB(x, y, z);
+        if (b === B.AIR) continue;
+        const isWater = b === B.WATER;
+        for (let f = 0; f < 6; f++){
+          const F = FACES[f];
+          const nb = getB(x + F.dir[0], y + F.dir[1], z + F.dir[2]);
+          if (isWater){ if (nb !== B.AIR) continue; }
+          else { if (!isTransparent(nb)) continue; }
+          const tile = TILEMAP[b][FACE_KIND[f]];
+          const P = isWater ? wpos : pos, U = isWater ? wuv : uv, N = isWater ? wnor : nor, I = isWater ? widxr : idxr;
+          const base = P.length / 3;
+          for (let c = 0; c < 4; c++){
+            const cc = F.corners[c];
+            P.push(x + cc[0], y + cc[1], z + cc[2]);
+            N.push(F.dir[0], F.dir[1], F.dir[2]);
+            const u = (c === 1 || c === 2) ? 1 : 0;
+            const v = (c === 2 || c === 3) ? 1 : 0;
+            U.push((tile + u) / TILES, 1 - v);
+          }
+          I.push(base, base + 1, base + 2, base, base + 2, base + 3);
+        }
+      }
+    }
+  }
+  function makeMesh(P, U, N, I, mat){
+    const g = new THREE.BufferGeometry();
+    g.setAttribute("position", new THREE.Float32BufferAttribute(P, 3));
+    g.setAttribute("uv", new THREE.Float32BufferAttribute(U, 2));
+    g.setAttribute("normal", new THREE.Float32BufferAttribute(N, 3));
+    g.setIndex(I);
+    const m = new THREE.Mesh(g, mat);
+    scene.add(m);
+    return m;
+  }
+  const mo = makeMesh(pos, uv, nor, idxr, matOpaque);
+  const mw = makeMesh(wpos, wuv, wnor, widxr, matWater);
+  chunkMeshes.set(key, { opaque:mo, water:mw });
+}
+function rebuildAround(x, z){
+  const cx = (x / CS) | 0, cz = (z / CS) | 0;
+  buildChunk(cx, cz);
+  if (x % CS === 0 && cx > 0) buildChunk(cx - 1, cz);
+  if (x % CS === CS - 1 && cx < W / CS - 1) buildChunk(cx + 1, cz);
+  if (z % CS === 0 && cz > 0) buildChunk(cx, cz - 1);
+  if (z % CS === CS - 1 && cz < D / CS - 1) buildChunk(cx, cz + 1);
+}
+/* ================= 花草装饰（十字面） ================= */
+function buildDecor(){
+  const pos = [], uv = [], nor = [], idxr = [];
+  const quads = [
+    [[-0.5, 0, -0.5], [0.5, 0, 0.5], [0.5, 1, 0.5], [-0.5, 1, -0.5]],
+    [[0.5, 0, -0.5], [-0.5, 0, 0.5], [-0.5, 1, 0.5], [0.5, 1, -0.5]]
+  ];
+  for (let x = 0; x < W; x++){
+    for (let z = 0; z < D; z++){
+      const h = heightAt(x, z);
+      if (h < WATER_Y + 1 || getB(x, h + 1, z) !== B.AIR) continue;
+      const r = hash(x * 13.7, z * 7.3);
+      if (r > 0.055) continue;
+      const isFlower = r < 0.02;
+      const tile = isFlower ? 10 : 11;
+      const hh = isFlower ? 0.55 : 0.8;
+      for (let d = 0; d < 2; d++){
+        const base = pos.length / 3;
+        for (let c = 0; c < 4; c++){
+          const q = quads[d][c];
+          pos.push(x + 0.5 + q[0], h + 1 + q[2] * hh, z + 0.5 + q[2]);
+          nor.push(0, 1, 0);
+          uv.push(((c === 1 || c === 2) ? tile + 1 : tile) / TILES, (c === 2 || c === 3) ? 0 : 1);
+        }
+        idxr.push(base, base + 1, base + 2, base, base + 2, base + 3);
+      }
+    }
+  }
+  if (!pos.length) return;
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
+  g.setAttribute("uv", new THREE.Float32BufferAttribute(uv, 2));
+  g.setAttribute("normal", new THREE.Float32BufferAttribute(nor, 3));
+  g.setIndex(idxr);
+  const m = new THREE.Mesh(g, new THREE.MeshLambertMaterial({ map:tex, transparent:true, alphaTest:0.45, side:THREE.DoubleSide, depthWrite:false }));
+  scene.add(m);
+}
+genWorld();
+for (let cx = 0; cx < W / CS; cx++){
+  for (let cz = 0; cz < D / CS; cz++) buildChunk(cx, cz);
+}
+buildDecor();
+/* ================= 生物系统 ================= */
+const MOB_CFG = {
+  chicken: { w:0.5, h:0.75, speed:0.7, passive:true,  body:[0.5,0.42,0.5, 0xf2f2e8], head:[0.28,0.28,0.28, 0xffffff], },
+  cow:     { w:0.9, h:1.4,  speed:0.6, passive:true,  body:[0.9,0.75,1.35, 0x8a6a4a], head:[0.45,0.45,0.45, 0x9a7a5a], },
+  pig:     { w:0.8, h:1.1,  speed:0.65, passive:true, body:[0.8,0.7,1.2, 0xe8a8a8],  head:[0.5,0.5,0.45, 0xedb4b4], },
+  zombie:  { w:0.7, h:1.9,  speed:0.9, passive:false, body:[0.7,1.1,0.5, 0x4a7a52], head:[0.55,0.55,0.55, 0x4a7a52], },
+};
+const mobMatCache = {};
+function mobMat(color){
+  if (!mobMatCache[color]) mobMatCache[color] = new THREE.MeshLambertMaterial({ color });
+  return mobMatCache[color];
+}
+function buildMobMesh(type){
+  const cfg = MOB_CFG[type];
+  const g = new THREE.Group();
+  const [bw, bh, bd, bc] = cfg.body;
+  const body = new THREE.Mesh(new THREE.BoxGeometry(bw, bh, bd), mobMat(bc));
+  body.position.y = bh / 2;
+  g.add(body);
+  const [hw, hh, hd, hc] = cfg.head;
+  const head = new THREE.Mesh(new THREE.BoxGeometry(hw, hh, hd), mobMat(hc));
+  head.position.y = bh + hh / 2 - 0.05;
+  if (type === "zombie") head.position.z = 0.12;
+  g.add(head);
+  if (type === "chicken"){
+    const beak = new THREE.Mesh(new THREE.BoxGeometry(0.14, 0.12, 0.14), mobMat(0xe8a33a));
+    beak.position.set(0, head.position.y - 0.05, 0.2);
+    g.add(beak);
+    const comb = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.14, 0.1), mobMat(0xd84a3a));
+    comb.position.set(0, head.position.y + 0.2, -0.04);
+    g.add(comb);
+    const wl = new THREE.Mesh(new THREE.BoxGeometry(0.32, 0.14, 0.08), mobMat(0xe8e2d8));
+    wl.position.set(-0.4, 0.34, 0);
+    g.add(wl);
+    const wr = wl.clone(); wr.position.x = 0.4; g.add(wr);
+    g.userData.wings = [wl, wr];
+  }
+  if (type === "zombie"){
+    const e1 = new THREE.Mesh(new THREE.BoxGeometry(0.08, 0.08, 0.02), new THREE.MeshBasicMaterial({ color:0xff3a2a }));
+    e1.position.set(-0.14, head.position.y + 0.08, 0.3);
+    const e2 = e1.clone(); e2.position.x = 0.14;
+    g.add(e1); g.add(e2);
+  }
+  const legN = type === "chicken" ? 2 : 4;
+  const legW = type === "chicken" ? 0.08 : 0.18, legH = type === "chicken" ? 0.28 : 0.5;
+  const legC = type === "chicken" ? 0xd8a83a : (type === "zombie" ? 0x3a5a42 : 0x5a4a3a);
+  const legs = [];
+  for (let i = 0; i < legN; i++){
+    const lx = (i % 2 === 0 ? -1 : 1) * (bw * 0.36);
+    const lz = (i < 2 ? -1 : 1) * (bd * 0.36);
+    const leg = new THREE.Mesh(new THREE.BoxGeometry(legW, legH, legW), mobMat(legC));
+    leg.position.set(lx, legH / 2, lz);
+    g.add(leg);
+    legs.push(leg);
+  }
+  g.userData.legs = legs;
+  return g;
+}
+class Mob {
+  constructor(type, x, z){
+    this.type = type;
+    this.cfg = MOB_CFG[type];
+    this.mesh = buildMobMesh(type);
+    this.x = x + 0.5; this.y = 0; this.z = z + 0.5;
+    this.vy = 0; this.onGround = false;
+    this.yaw = Math.random() * Math.PI * 2;
+    this.dirT = 1 + Math.random() * 3;
+    this.walk = 0;
+    this.alive = true;
+    scene.add(this.mesh);
+    // 找地表
+    for (let y = H - 1; y > 0; y--){
+      if (isSolidB(x, y - 1, z) && !isSolidB(x, y, z)){ this.y = y; break; }
+    }
+    this.sync();
+  }
+  sync(){
+    this.mesh.position.set(this.x, this.y, this.z);
+    this.mesh.rotation.y = this.yaw;
+  }
+  hitTest(nx, ny, nz){
+    const w = this.cfg.w / 2, h = this.cfg.h;
+    const x0 = Math.floor(nx - w), x1 = Math.floor(nx + w);
+    const y0 = Math.floor(ny), y1 = Math.floor(ny + h);
+    const z0 = Math.floor(nz - w), z1 = Math.floor(nz + w);
+    for (let x = x0; x <= x1; x++)
+      for (let y = y0; y <= y1; y++)
+        for (let z = z0; z <= z1; z++)
+          if (isSolidB(x, y, z)) return true;
+    return false;
+  }
+  inWater(){
+    const y0 = Math.floor(this.y + 0.2);
+    return isInWater(Math.floor(this.x), y0, Math.floor(this.z));
+  }
+  update(dt, t){
+    if (!this.alive) return;
+    let mx = 0, mz = 0, moving = false;
+    if (this.cfg.passive){
+      this.dirT -= dt;
+      if (this.dirT <= 0){
+        this.dirT = 1.5 + Math.random() * 3;
+        if (Math.random() < 0.3){ this.yaw = Math.random() * Math.PI * 2; moving = true; }
+        else moving = false;
+        if (moving) this.yaw += (Math.random() - 0.5) * 1.2;
+      } else moving = true;
+    } else {
+      // 僵尸：追玩家
+      const dx = P.pos.x - this.x, dz = P.pos.z - this.z;
+      const d = Math.hypot(dx, dz);
+      if (d > 1.2){ this.yaw = Math.atan2(dx, dz); moving = true; }
+      else moving = false;
+    }
+    if (moving){
+      const sp = this.cfg.speed;
+      const sin = Math.sin(this.yaw), cos = Math.cos(this.yaw);
+      this.x += sin * sp * dt; if (this.hitTest(this.x, this.y, this.z)) this.x -= sin * sp * dt;
+      this.z += cos * sp * dt; if (this.hitTest(this.x, this.y, this.z)) this.z -= cos * sp * dt;
+      this.x = Math.max(0.5, Math.min(W - 0.5, this.x));
+      this.z = Math.max(0.5, Math.min(D - 0.5, this.z));
+      this.walk += dt;
+    }
+    if (this.inWater()){
+      this.vy = Math.min(this.vy + 20 * dt, 1.2);
+      if (this.vy < 0) this.vy = 0.4;
+    } else {
+      this.vy -= 26 * dt;
+      if (this.vy < -40) this.vy = -40;
+    }
+    this.y += this.vy * dt;
+    this.onGround = false;
+    if (this.hitTest(this.x, this.y, this.z)){
+      if (this.vy < 0) this.onGround = true;
+      this.y -= this.vy * dt; this.vy = 0;
+    }
+    if (this.y < -12){ this.kill(); return; }
+    this.sync();
+    // 走路动画
+    const legs = this.mesh.userData.legs;
+    const swing = moving ? Math.sin(this.walk * 7) : 0;
+    legs.forEach((l, i) => l.rotation.x = (i % 2 === 0 ? 1 : -1) * swing * 0.55);
+    if (this.mesh.userData.wings){
+      this.mesh.userData.wings.forEach((w2, i) => w2.rotation.z = (i === 0 ? 1 : -1) * (moving ? swing * 0.4 : Math.sin(t * 6) * 0.12));
+    }
+  }
+  kill(){
+    this.alive = false;
+    scene.remove(this.mesh);
+  }
+}
+let mobs = [];function spawnPassive(){
+  const types = ["chicken", "cow", "pig"];
+  for (let i = 0; i < 26; i++){
+    const type = types[i % types.length];
+    for (let tryN = 0; tryN < 20; tryN++){
+      const x = 4 + Math.random() * (W - 8) | 0, z = 4 + Math.random() * (D - 8) | 0;
+      const h = heightAt(x, z);
+      if (h > WATER_Y + 1 && !isSolidB(x, h + 1, z)){
+        mobs.push(new Mob(type, x, z));
+        break;
+      }
+    }
+  }
+}
+function spawnZombie(){
+  for (let tryN = 0; tryN < 30; tryN++){
+    const x = 4 + Math.random() * (W - 8) | 0, z = 4 + Math.random() * (D - 8) | 0;
+    const h = heightAt(x, z);
+    const dx = x - P.pos.x, dz = z - P.pos.z;
+    if (h > WATER_Y + 1 && Math.hypot(dx, dz) > 22 && !isSolidB(x, h + 1, z)){
+      mobs.push(new Mob("zombie", x, z));
+      return;
+    }
+  }
+}
+/* ================= 玩家 ================= */
+const P = {
+  pos: new THREE.Vector3(W / 2 + 0.5, heightAt(W / 2, D / 2) + 3, D / 2 + 0.5),
+  vy: 0, onGround: false, yaw: 0, pitch: 0
+};
+(function (){
+  const sx = (W / 2) | 0, sz = (D / 2) | 0;
+  for (let y = H - 1; y > 0; y--){
+    if (getB(sx, y, sz) === B.AIR){ P.pos.y = y + 0.1; break; }
+  }
+})();
+const EYE = 1.62, PW = 0.3, PH = 1.8;
+const keys = new Set();
+addEventListener("keydown", e => keys.add(e.code));
+addEventListener("keyup", e => keys.delete(e.code));
+function boxCollides(px, py, pz){
+  const x0 = Math.floor(px - PW), x1 = Math.floor(px + PW);
+  const y0 = Math.floor(py), y1 = Math.floor(py + PH);
+  const z0 = Math.floor(pz - PW), z1 = Math.floor(pz + PW);
+  for (let x = x0; x <= x1; x++)
+    for (let y = y0; y <= y1; y++)
+      for (let z = z0; z <= z1; z++)
+        if (isSolidB(x, y, z)) return true;
+  return false;
+}
+function updatePlayer(dt){
+  let mx = 0, mz = 0;
+  if (keys.has("KeyW")){ mx -= Math.sin(P.yaw); mz -= Math.cos(P.yaw); }
+  if (keys.has("KeyS")){ mx += Math.sin(P.yaw); mz += Math.cos(P.yaw); }
+  if (keys.has("KeyD")){ mx += Math.cos(P.yaw); mz -= Math.sin(P.yaw); }
+  if (keys.has("KeyA")){ mx -= Math.cos(P.yaw); mz += Math.sin(P.yaw); }
+  const ml = Math.hypot(mx, mz);
+  if (ml > 0){ mx /= ml; mz /= ml; }
+  const sp = 4.6;
+  P.pos.x += mx * sp * dt; if (boxCollides(P.pos.x, P.pos.y, P.pos.z)) P.pos.x -= mx * sp * dt;
+  P.pos.z += mz * sp * dt; if (boxCollides(P.pos.x, P.pos.y, P.pos.z)) P.pos.z -= mz * sp * dt;
+  P.vy -= 26 * dt;
+  if (P.vy < -55) P.vy = -55;
+  if (keys.has("Space") && P.onGround){ P.vy = 8.6; P.onGround = false; }
+  P.pos.y += P.vy * dt;
+  P.onGround = false;
+  if (boxCollides(P.pos.x, P.pos.y, P.pos.z)){
+    if (P.vy < 0) P.onGround = true;
+    P.pos.y -= P.vy * dt; P.vy = 0;
+  }
+  if (P.pos.y < -10) P.pos.set(W / 2, heightAt(W / 2, D / 2) + 3, D / 2);
+  camera.position.set(P.pos.x, P.pos.y + EYE, P.pos.z);
+  camera.rotation.y = P.yaw;
+  camera.rotation.x = P.pitch;
+}
+/* ================= 射线挖/放方块 ================= */
+function raycast(){
+  const ox = camera.position.x, oy = camera.position.y, oz = camera.position.z;
+  const dir = new THREE.Vector3();
+  camera.getWorldDirection(dir);
+  let x = Math.floor(ox), y = Math.floor(oy), z = Math.floor(oz);
+  const sx = dir.x > 0 ? 1 : -1, sy = dir.y > 0 ? 1 : -1, sz = dir.z > 0 ? 1 : -1;
+  const tdx = Math.abs(dir.x) > 1e-9 ? Math.abs(1 / dir.x) : Infinity;
+  const tdy = Math.abs(dir.y) > 1e-9 ? Math.abs(1 / dir.y) : Infinity;
+  const tdz = Math.abs(dir.z) > 1e-9 ? Math.abs(1 / dir.z) : Infinity;
+  let tx = sx > 0 ? (x + 1 - ox) * tdx : (ox - x) * tdx;
+  let ty = sy > 0 ? (y + 1 - oy) * tdy : (oy - y) * tdy;
+  let tz = sz > 0 ? (z + 1 - oz) * tdz : (oz - z) * tdz;
+  let t = 0, px = x, py = y, pz = z;
+  while (t < 7){
+    if (t > 0 && isSolidB(x, y, z)) return { x, y, z, px, py, pz };
+    px = x; py = y; pz = z;
+    if (tx < ty && tx < tz){ x += sx; t = tx; tx += tdx; }
+    else if (ty < tz){ y += sy; t = ty; ty += tdy; }
+    else { z += sz; t = tz; tz += tdz; }
+  }
+  return null;
+}
+function hitsPlayer(px, py, pz){
+  return px + 1 > P.pos.x - PW && px < P.pos.x + PW &&
+         py + 1 > P.pos.y      && py < P.pos.y + PH &&
+         pz + 1 > P.pos.z - PW && pz < P.pos.z + PW;
+}
+const hlLine = new THREE.LineSegments(
+  new THREE.EdgesGeometry(new THREE.BoxGeometry(1.003, 1.003, 1.003)),
+  new THREE.LineBasicMaterial({ color:0x000000 })
+);
+scene.add(hlLine);
+let sel = B.GRASS;
+const BLOCK_COLOR = {};
+BLOCK_COLOR[B.GRASS] = 0x68ab4a; BLOCK_COLOR[B.DIRT] = 0x866043; BLOCK_COLOR[B.STONE] = 0x808086;
+BLOCK_COLOR[B.SAND] = 0xdbc98d; BLOCK_COLOR[B.WOOD] = 0x6e5230; BLOCK_COLOR[B.LEAVES] = 0x2e7437;
+BLOCK_COLOR[B.GLASS] = 0xc8e4ee;
+/* 挖/放粒子 */
+const parts = [];
+{
+  const pm = new THREE.MeshBasicMaterial({ color:0xffffff });
+  for (let i = 0; i < 16; i++){
+    const m = new THREE.Mesh(new THREE.BoxGeometry(0.16, 0.16, 0.16), pm.clone());
+    m.visible = false;
+    scene.add(m);
+    parts.push({ m, vx:0, vy:0, vz:0, life:0 });
+  }
+}
+function burst(x, y, z, color){
+  for (const p of parts){
+    if (p.life > 0) continue;
+    p.m.visible = true;
+    p.m.material.color.setHex(color);
+    p.m.position.set(x + 0.5, y + 0.5, z + 0.5);
+    const a = Math.random() * Math.PI * 2, b = (Math.random() - 0.5) * Math.PI * 0.7;
+    const sp = 1.8 + Math.random() * 2.6;
+    p.vx = Math.cos(a) * Math.cos(b) * sp;
+    p.vy = Math.abs(Math.sin(b)) * sp + 1.6;
+    p.vz = Math.sin(a) * Math.cos(b) * sp;
+    p.life = 0.65;
+    break;
+  }
+}
+function updateParts(dt){
+  for (const p of parts){
+    if (p.life <= 0) continue;
+    p.life -= dt;
+    p.vy -= 17 * dt;
+    p.m.position.x += p.vx * dt;
+    p.m.position.y += p.vy * dt;
+    p.m.position.z += p.vz * dt;
+    if (p.life <= 0) p.m.visible = false;
+  }
+}
+renderer.domElement.addEventListener("mousedown", e => {
+  if (document.pointerLockElement !== renderer.domElement) return;
+  const hit = raycast();
+  if (!hit) return;
+  if (e.button === 0){
+    const bc = getB(hit.x, hit.y, hit.z);
+    setB(hit.x, hit.y, hit.z, B.AIR);
+    rebuildAround(hit.x, hit.z);
+    if (BLOCK_COLOR[bc] !== undefined) burst(hit.x, hit.y, hit.z, BLOCK_COLOR[bc]);
+  } else if (e.button === 2){
+    const nx = hit.px, ny = hit.py, nz = hit.pz;
+    if (inB(nx, ny, nz) && getB(nx, ny, nz) === B.AIR && !hitsPlayer(nx, ny, nz)){
+      setB(nx, ny, nz, sel);
+      rebuildAround(nx, nz);
+      if (BLOCK_COLOR[sel] !== undefined) burst(nx, ny, nz, BLOCK_COLOR[sel]);
+    }
+  }
+});
+addEventListener("contextmenu", e => e.preventDefault());
+/* ================= 指针锁定 & 鼠标视角 ================= */
+const overlay = document.getElementById("overlay");
+overlay.addEventListener("click", () => renderer.domElement.requestPointerLock());
+document.addEventListener("pointerlockchange", () => {
+  const locked = document.pointerLockElement === renderer.domElement;
+  overlay.classList.toggle("hidden", locked);
+});
+addEventListener("mousemove", e => {
+  if (document.pointerLockElement !== renderer.domElement) return;
+  P.yaw -= e.movementX * 0.0024;
+  P.pitch -= e.movementY * 0.0024;
+  P.pitch = Math.max(-1.55, Math.min(1.55, P.pitch));
+});
+/* ================= 物品栏 ================= */
+const HOT = [B.GRASS, B.DIRT, B.STONE, B.SAND, B.WOOD, B.LEAVES, B.GLASS];
+const HOTCOLOR = {};
+HOTCOLOR[B.GRASS] = "#68ab4a"; HOTCOLOR[B.DIRT] = "#866043"; HOTCOLOR[B.STONE] = "#808086";
+HOTCOLOR[B.SAND] = "#dbc98d"; HOTCOLOR[B.WOOD] = "#6e5230"; HOTCOLOR[B.LEAVES] = "#2e7437";
+HOTCOLOR[B.GLASS] = "#c8e4ee";
+let hotSel = 0;
+const hotbar = document.getElementById("hotbar");
+const slotEls = [];
+HOT.forEach((b, i) => {
+  const d = document.createElement("div");
+  d.className = "slot";
+  d.innerHTML = '<div class="sw" style="background:' + HOTCOLOR[b] + '"></div>' + (i + 1) + " " + BNAME[b];
+  hotbar.appendChild(d);
+  slotEls.push(d);
+});
+function refreshHot(){ slotEls.forEach((el, i) => el.classList.toggle("sel", i === hotSel)); }
+refreshHot();
+addEventListener("keydown", e => {
+  const n = parseInt(e.key, 10);
+  if (n >= 1 && n <= HOT.length){ hotSel = n - 1; sel = HOT[hotSel]; refreshHot(); }
+});
+const hud = document.getElementById("hud");
+/* ================= 生物生成 & 昼夜节奏 ================= */
+spawnPassive();
+let zombieTimer = 0;
+function manageMobs(dt){
+  // 夜晚生成僵尸，白天清理
+  const night = sunAlt < -0.1;
+  const zombies = mobs.filter(m => m.type === "zombie");
+  if (night && zombies.length < 7){
+    zombieTimer -= dt;
+    if (zombieTimer <= 0){
+      zombieTimer = 2 + Math.random() * 3;
+      spawnZombie();
+    }
+  } else if (!night && zombies.length){
+    zombies.forEach(z => z.kill());
+    mobs = mobs.filter(m => m.alive);
+  }
+}
+/* ================= 主循环 ================= */
+let last = performance.now(), frames = 0, fps = 0, fpsT = last, elapsed = 0;
+function loop(){
+  requestAnimationFrame(loop);
+  const now = performance.now();
+  let dt = (now - last) / 1000; last = now;
+  if (dt > 0.05) dt = 0.05;
+  elapsed += dt;
+  if (document.pointerLockElement === renderer.domElement) updatePlayer(dt);
+  updateSky(dt, elapsed);
+  manageMobs(dt);
+  for (const m of mobs) m.update(dt, elapsed);
+  // 生物间简单分离
+  for (let i = 0; i < mobs.length; i++){
+    if (!mobs[i].alive) continue;
+    for (let j = i + 1; j < mobs.length; j++){
+      if (!mobs[j].alive) continue;
+      const a = mobs[i], b = mobs[j];
+      const dx = b.x - a.x, dz = b.z - a.z;
+      const d = Math.hypot(dx, dz);
+      const minD = (a.cfg.w + b.cfg.w) * 0.55;
+      if (d > 1e-4 && d < minD){
+        const push = (minD - d) * 0.5;
+        a.x -= dx / d * push; a.z -= dz / d * push;
+        b.x += dx / d * push; b.z += dz / d * push;
+      }
+    }
+  }
+  const hit = raycast();
+  if (hit){ hlLine.visible = true; hlLine.position.set(hit.x + 0.5, hit.y + 0.5, hit.z + 0.5); }
+  else hlLine.visible = false;
+  updateParts(dt);
+  renderer.render(scene, camera);
+  frames++;
+  if (now - fpsT > 500){ fps = Math.round(frames * 1000 / (now - fpsT)); frames = 0; fpsT = now; }
+  hud.innerHTML = "FPS " + fps + " · 位置 " + (P.pos.x | 0) + " " + (P.pos.y | 0) + " " + (P.pos.z | 0) +
+    "<br>手持：" + BNAME[sel] + " · 生物：" + mobs.filter(m => m.alive).length;
+}
+loop();
+addEventListener("resize", () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+</script>
+</body>
+</html>
